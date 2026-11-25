@@ -18,6 +18,8 @@ from resource_queries import (
     Configuration,
     FlightControlClient,
     FlightControlError,
+    format_console_result,
+    strip_cli_noise,
 )
 
 FAKE_CA_PEM = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
@@ -368,3 +370,125 @@ class TestOrgAndDeviceLookup:
             with pytest.raises(FlightControlError):
                 c.resolve_device("bad name!")
         q.assert_not_called()
+
+
+ONLINE = {"metadata": {"name": "o1top"}, "status": {"summary": {"status": "Online", "info": "ok"}}}
+OFFLINE = {
+    "metadata": {"name": "eh5t"},
+    "status": {"summary": {"status": "Unknown", "info": "Device is disconnected"}},
+}
+NOISE = 'time="2026-11-25T16:05:16Z" level=info msg="no refresh token found, skipping token refresh"\n'
+
+
+def completed(rc=0, out="", err=""):
+    return subprocess.CompletedProcess(args=[], returncode=rc, stdout=out, stderr=err)
+
+
+@pytest.fixture
+def console_client(tmp_path):
+    c = client_with_token_url(organization="org-1")
+    c.console_config_dir = tmp_path / "fcmcp"
+    return c
+
+
+def run_console(c, side_effect, device=ONLINE, command="uptime", **kw):
+    with patch.object(c, "resolve_device", return_value=device), patch.object(
+        c, "_get_access_token", return_value="tok-1"
+    ), patch("resource_queries.shutil.which", return_value="/usr/bin/flightctl"), patch(
+        "resource_queries.subprocess.run", side_effect=side_effect
+    ) as run:
+        out = c.run_console_command("/usr/bin/flightctl", "ushift-1", command, **kw)
+    return out, run
+
+
+class TestConsole:
+    def test_login_then_console_with_private_config_dir(self, console_client):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            if cmd[1] == "login":
+                cred = Path(cmd[cmd.index("--credentials-file") + 1])
+                seen["cred"] = json.loads(cred.read_text())
+                seen["mode"] = cred.stat().st_mode & 0o777
+            return completed(0, "up 6:38\n", NOISE)
+
+        out, run = run_console(console_client, fake_run, command="oc get pods -A | wc -l")
+        d = str(console_client.console_config_dir)
+        login, console = run.call_args_list[0].args[0], run.call_args_list[1].args[0]
+        assert login == [
+            "/usr/bin/flightctl", "login", "https://fc.lab.local:3443",
+            "--config-dir", d, "--credentials-file", f"{d}/credentials.json",
+            "--certificate-authority", "/tmp/api-ca.crt", "--org", "org-1",
+        ]
+        assert console == [
+            "/usr/bin/flightctl", "console", "device/o1top", "--config-dir", d, "--notty",
+            "--org", "org-1", "--", "sh", "-c", "oc get pods -A | wc -l",
+        ]
+        assert seen == {"cred": {"token": "tok-1"}, "mode": 0o600}
+        assert not (console_client.console_config_dir / "credentials.json").exists()
+        assert console_client.console_config_dir.stat().st_mode & 0o777 == 0o700
+        assert "tok-1" not in " ".join(login + console)
+        assert out == "up 6:38"
+
+    def test_login_only_when_token_changes(self, console_client):
+        run_console(console_client, lambda cmd, **kw: completed(0, "x"))
+        _, run = run_console(console_client, lambda cmd, **kw: completed(0, "x"))
+        assert run.call_count == 1
+        assert run.call_args.args[0][1] == "console"
+
+    def test_offline_device_refused_before_console(self, console_client):
+        with patch.object(console_client, "resolve_device", return_value=OFFLINE), patch(
+            "resource_queries.shutil.which", return_value="/usr/bin/flightctl"
+        ), patch("resource_queries.subprocess.run") as run:
+            with pytest.raises(FlightControlError, match="is Unknown: Device is disconnected.*last-known status"):
+                console_client.run_console_command("/usr/bin/flightctl", "ushift-3", "uptime")
+        run.assert_not_called()
+
+    def test_nonzero_exit_returns_code_and_streams(self, console_client):
+        def fake_run(cmd, **kw):
+            return completed(0) if cmd[1] == "login" else completed(3, "out\n", NOISE + "err\n")
+
+        out, _ = run_console(console_client, fake_run)
+        assert out == "exit code: 3\n--- stdout ---\nout\n--- stderr ---\nerr"
+
+    def test_timeout(self, console_client):
+        def fake_run(cmd, **kw):
+            if cmd[1] == "console":
+                raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+            return completed(0)
+
+        with pytest.raises(FlightControlError, match="timed out after 5s"):
+            run_console(console_client, fake_run, timeout=5)
+
+    def test_login_failure_cleans_up_credentials(self, console_client):
+        def fake_run(cmd, **kw):
+            raise subprocess.CalledProcessError(1, cmd, stderr=NOISE + "Error: unauthorized\n")
+
+        with pytest.raises(FlightControlError, match="Failed to login to flightctl console: Error: unauthorized"):
+            run_console(console_client, fake_run)
+        assert not (console_client.console_config_dir / "credentials.json").exists()
+
+    def test_empty_command_rejected(self, console_client):
+        with patch("resource_queries.shutil.which", return_value="/usr/bin/flightctl"):
+            with pytest.raises(FlightControlError, match="Command cannot be empty"):
+                console_client.run_console_command("/usr/bin/flightctl", "ushift-1", "  ")
+
+
+class TestConsoleHelpers:
+    def test_strip_cli_noise(self):
+        assert strip_cli_noise(NOISE + "real error\n" + 'time="t" level=debug msg="b"\n') == "real error\n"
+
+    def test_clean_success_is_just_stdout(self):
+        assert format_console_result(0, "hello\n", "", max_output=100) == "hello"
+
+    def test_output_cap(self):
+        assert format_console_result(0, "a" * 100, "", max_output=10) == "a" * 10 + "\n[... truncated: 90 more bytes]"
+
+
+class TestCliStdoutClean:
+    def test_skip_existing_prints_nothing(self, capsys):
+        from cli import FlightctlCLI
+
+        with patch("cli.shutil.which", return_value="/usr/bin/flightctl"):
+            FlightctlCLI("https://api.test.com").download()
+        assert capsys.readouterr().out == ""

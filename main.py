@@ -423,28 +423,30 @@ async def query_resource_syncs(
 @mcp.tool()
 async def run_command_on_device(device_name: str, command: str) -> str:
     """
-    Runs a Linux console command on a specific device using the Flightctl CLI.
+    Runs a Linux shell command on a device through the Flight Control console and returns its output.
 
-    This tool allows the MCP server to remotely execute shell commands on an edge device
-    managed by Flight Control. The Flightctl CLI is downloaded at runtime to ensure it
-    matches the API server version. The command is executed in a remote console session
-    using `flightctl console device/<device_name> -- <command>`.
-
-    This is useful for:
-    - Retrieving live system information (e.g., `journalctl`, `ps`, `df`, `cat /proc/meminfo`)
-      Specifically, you can find information about the agent managing the device using `journalctl -u flightctl-agent`
-    - Performing diagnostics or ad hoc checks
-    - Making on-device changes (e.g., restarting services or applying quick fixes)
+    The command runs as `sh -c '<command>'` (pipes and quotes work) through
+    `flightctl console device/<name>`, which reaches the device over its agent's outbound
+    connection to Flight Control - no direct network access to the device is needed.
 
     Args:
-        device_name (str): The name of the target device resource.
-        command (str): The Linux shell command to run on the device.
+        device_name (str): The device's alias (e.g. "ushift-1") or its generated name.
+        command (str): The shell command to run.
+
+    The command runs as the `flightctl-console` user, which has passwordless sudo. Use sudo for
+    anything privileged, for example:
+    - `sudo oc get pods -A --kubeconfig /var/lib/microshift/resources/kubeadmin/kubeconfig`
+    - `sudo journalctl -u microshift -n 50 --no-pager`
+    - `sudo journalctl -u flightctl-agent -n 50 --no-pager`
+    - `sudo bootc status`
 
     Returns:
-        str: The standard output (stdout) of the command execution.
+        str: stdout on success. If the command exits non-zero or writes to stderr, the result is
+        "exit code: N", then "--- stdout ---" and "--- stderr ---" sections. Each stream is capped
+        at 64 KiB; the command times out after 60 s.
 
-    Raises:
-        RuntimeError: If the CLI is not found or the command fails to execute.
+    If the device is offline, the tool says so instead of running anything; use query_devices for
+    its last-known status.
     """
     return get_client().run_console_command(get_cli().cli_path, device_name, command)
 

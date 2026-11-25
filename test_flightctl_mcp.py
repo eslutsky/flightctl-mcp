@@ -228,15 +228,19 @@ class TestFlightControlClient:
                 client.query_devices()
 
     @patch("resource_queries.subprocess.run")
-    def test_console_command_success(self, mock_run, client):
+    def test_console_command_success(self, mock_run, client, tmp_path):
         """Test successful console command execution."""
-        # Mock successful command execution
         mock_result = Mock()
+        mock_result.returncode = 0
         mock_result.stdout = "command output"
+        mock_result.stderr = ""
         mock_run.return_value = mock_result
+        client.console_config_dir = tmp_path
+        device = {"metadata": {"name": "test-device"}, "status": {"summary": {"status": "Online"}}}
 
-        # Mock token refresh and CLI check
-        with patch.object(client, "_get_access_token", return_value="valid-token"):
+        with patch.object(client, "_get_access_token", return_value="valid-token"), patch.object(
+            client, "resolve_device", return_value=device
+        ):
             with patch("resource_queries.shutil.which", return_value="/usr/bin/flightctl"):
                 result = client.run_console_command("/usr/bin/flightctl", "test-device", "ps aux")
 
@@ -244,16 +248,17 @@ class TestFlightControlClient:
         assert mock_run.call_count == 2  # login + command
 
     @patch("resource_queries.subprocess.run")
-    def test_console_command_failure(self, mock_run, client):
+    def test_console_command_failure(self, mock_run, client, tmp_path):
         """Test console command execution failure."""
         import subprocess
 
-        # Mock command execution failure
-        error = subprocess.CalledProcessError(1, ["flightctl"], stderr="Command failed")
-        mock_run.side_effect = error
+        mock_run.side_effect = subprocess.CalledProcessError(1, ["flightctl"], stderr="Command failed")
+        client.console_config_dir = tmp_path
+        device = {"metadata": {"name": "test-device"}, "status": {"summary": {"status": "Online"}}}
 
-        # Mock token refresh and CLI check
-        with patch.object(client, "_get_access_token", return_value="valid-token"):
+        with patch.object(client, "_get_access_token", return_value="valid-token"), patch.object(
+            client, "resolve_device", return_value=device
+        ):
             with patch("resource_queries.shutil.which", return_value="/usr/bin/flightctl"):
                 with pytest.raises(FlightControlError, match="Failed to login"):
                     client.run_console_command("/usr/bin/flightctl", "test-device", "ps aux")

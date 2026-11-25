@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import logging.handlers
 import os
@@ -120,6 +121,31 @@ def _is_invalid_grant(resp: Any) -> bool:
 
 # A Kubernetes-style label value; anything else can't be an alias, so skip the label lookup.
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
+
+# Device summary states in which a console session can't work.
+OFFLINE_STATES = frozenset({"Unknown", "Offline", "PoweredOff"})
+
+_CLI_NOISE = re.compile(r'^time="[^"]*" level=(trace|debug|info) ')
+
+
+def strip_cli_noise(stderr: str) -> str:
+    """Drop the flightctl CLI's own info/debug log lines, keep everything else."""
+    return "".join(line for line in stderr.splitlines(keepends=True) if not _CLI_NOISE.match(line))
+
+
+def format_console_result(returncode: int, stdout: str, stderr: str, max_output: int) -> str:
+    """Plain stdout on a clean success; otherwise exit code plus both streams. Each stream capped."""
+
+    def cap(text: str) -> str:
+        data = text.encode()
+        if len(data) <= max_output:
+            return text
+        return data[:max_output].decode(errors="ignore") + f"\n[... truncated: {len(data) - max_output} more bytes]"
+
+    out, err = stdout.rstrip("\n"), stderr.rstrip("\n")
+    if returncode == 0 and not err.strip():
+        return cap(out)
+    return "\n".join([f"exit code: {returncode}", "--- stdout ---", cap(out), "--- stderr ---", cap(err)])
 
 
 class Configuration:
@@ -395,81 +421,85 @@ class FlightControlClient:
             raise FlightControlError(f"No device named or aliased '{name_or_alias}'")
         return device
 
-    def run_console_command(self, cli_path: str, device_name: str, command: str) -> str:
+    def run_console_command(
+        self, cli_path: str, device_name: str, command: str, timeout: int = 60, max_output: int = 64 * 1024
+    ) -> str:
         """
-        Runs a console command on a device using the installed flightctl CLI.
-        Args:
-            cli_path: The path to the flightctl CLI binary.
-            device_name: The name of the target device.
-            command: The shell command to execute (as a string).
-        Returns:
-            The standard output from the console command.
-        Raises:
-            FlightControlError: On CLI failure or configuration issues.
-        """
-        self.logger.info("Running console command on device '%s': %s", device_name, command)
+        Run a shell command on a device through `flightctl console` and return its output.
 
-        if not shutil.which("flightctl"):
-            self.logger.error("flightctl CLI not found in PATH")
+        The device can be given by its `alias` label or its generated name. The CLI runs with a
+        private config dir (self.console_config_dir), so the user's own `flightctl login` is never
+        touched. The command runs under `sh -c` as the device's `flightctl-console` user.
+        """
+        if not shutil.which(cli_path):
             raise FlightControlError("flightctl CLI not found. Please ensure it's installed and in PATH.")
-
-        # Validate inputs
         if not device_name or not device_name.strip():
             raise FlightControlError("Device name cannot be empty")
         if not command or not command.strip():
             raise FlightControlError("Command cannot be empty")
 
+        device = self.resolve_device(device_name.strip())
+        name = device["metadata"]["name"]
+        summary = (device.get("status") or {}).get("summary") or {}
+        state = summary.get("status")
+        if state in OFFLINE_STATES:
+            raise FlightControlError(
+                f"Device '{device_name}' ({name}) is {state}: {summary.get('info') or 'no details'}. "
+                "Commands need a connected device; its last-known status is still available through query_devices."
+            )
+
+        self._console_login(cli_path, self._get_access_token())
+        cmd = [cli_path, "console", f"device/{name}", "--config-dir", str(self.console_config_dir), "--notty"]
+        if self.config.organization:
+            cmd += ["--org", self.config.organization]
+        cmd += ["--", "sh", "-c", command]
+
+        self.logger.info("Running console command on device %s (%s): %s", device_name, name, command)
         try:
-            # Get access token for authentication
-            access_token = self._get_access_token()
-        except AuthenticationError as e:
-            self.logger.error("Failed to get access token for console command: %s", e)
-            raise
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise FlightControlError(f"Command timed out after {timeout}s on device '{device_name}'")
+        except OSError as e:
+            raise FlightControlError(f"Failed to run flightctl console: {e}")
+        return format_console_result(result.returncode, result.stdout, strip_cli_noise(result.stderr), max_output)
 
-        # Login with the CLI
-        login_cmd = [
-            cli_path,
-            "console",
-            "login",
-            "--insecure-skip-tls-verify" if self.config.insecure_skip_verify else "",
-            "--token",
-            access_token,
-        ]
-        # Remove empty strings from the command
-        login_cmd = [arg for arg in login_cmd if arg]
+    def _console_login(self, cli_path: str, access_token: str) -> None:
+        """Log the private CLI config in with our access token; only when the token changed."""
+        if access_token == self._console_token:
+            return
+        conf_dir = self.console_config_dir
+        conf_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(conf_dir, 0o700)
+        cred = conf_dir / "credentials.json"
+        fd = os.open(cred, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"token": access_token}, f)
 
-        self.logger.debug("Logging in to flightctl console")
-        try:
-            result = subprocess.run(login_cmd, check=True, capture_output=True, text=True)
-            self.logger.debug("Console login successful")
-        except subprocess.CalledProcessError as e:
-            self.logger.error("Console login failed: %s", e.stderr)
-            raise FlightControlError(f"Failed to login to flightctl console: {e.stderr}")
-
-        # Execute the command
         cmd = [
             cli_path,
-            "console",
-            f"device/{device_name}",
-            "--insecure-skip-tls-verify" if self.config.insecure_skip_verify else "",
-            "--",
-        ] + command.split()
-        # Remove empty strings from the command
-        cmd = [arg for arg in cmd if arg]
-
-        self.logger.debug("Executing console command: %s", " ".join(cmd[: -len(command.split())]))
+            "login",
+            self.config.api_base_url,
+            "--config-dir",
+            str(conf_dir),
+            "--credentials-file",
+            str(cred),
+        ]
+        verify = self.config.get_ssl_verify()
+        if verify is False:
+            cmd.append("--insecure-skip-tls-verify")
+        elif isinstance(verify, str):
+            cmd += ["--certificate-authority", verify]
+        if self.config.organization:
+            cmd += ["--org", self.config.organization]
         try:
-            result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            self.logger.info("Console command completed successfully on device '%s'", device_name)
-            return result.stdout.strip()
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
         except subprocess.CalledProcessError as e:
-            self.logger.error(
-                "Console command failed on device '%s': exit code %d, stderr: %s", device_name, e.returncode, e.stderr
-            )
-            raise FlightControlError(f"Console command failed on device '{device_name}': {e.stderr}")
-        except Exception as e:
-            self.logger.error("Unexpected error running console command on device '%s': %s", device_name, e)
-            raise FlightControlError(f"Unexpected error running console command: {e}")
+            raise FlightControlError(f"Failed to login to flightctl console: {strip_cli_noise(e.stderr or '').strip()}")
+        except subprocess.TimeoutExpired:
+            raise FlightControlError("Timed out logging in to flightctl console")
+        finally:
+            cred.unlink(missing_ok=True)
+        self._console_token = access_token
 
     # --- Internal Methods ---
 

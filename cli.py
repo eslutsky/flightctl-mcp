@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import subprocess
@@ -22,7 +23,7 @@ class FlightctlCLI:
         # Check if flightctl is already available system-wide
         existing_cli = shutil.which("flightctl")
         if existing_cli:
-            print("flightctl CLI already available system-wide, skipping download")
+            logging.getLogger(__name__).info("flightctl CLI already available at %s, skipping download", existing_cli)
             self.cli_path = existing_cli
             return
 
@@ -32,8 +33,8 @@ class FlightctlCLI:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tar_path = os.path.join(tmpdir, "flightctl.tar.gz")
-            subprocess.run(["curl", "-kfLo", tar_path, cli_url], check=True)
-            subprocess.run(["tar", "-xvf", tar_path, "-C", tmpdir], check=True)
+            subprocess.run(["curl", "-kfLo", tar_path, cli_url], check=True, capture_output=True)
+            subprocess.run(["tar", "-xf", tar_path, "-C", tmpdir], check=True, capture_output=True)
 
             extracted_path = os.path.join(tmpdir, "flightctl")
             if not os.path.isfile(extracted_path):
