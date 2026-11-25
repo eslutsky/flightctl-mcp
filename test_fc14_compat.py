@@ -198,6 +198,27 @@ class TestDiscovery:
         with pytest.raises(FlightControlError, match="OIDC_TOKEN_URL not configured"):
             FlightControlClient(fc14_mock_config(oidc_issuer=None))
 
+    @patch("resource_queries.requests.get")
+    def test_discovery_retried_after_failure(self, mock_get):
+        mock_get.side_effect = [
+            requests.exceptions.ConnectionError("boom"),
+            response(200, {"token_endpoint": TOKEN_URL}),
+        ]
+        client = FlightControlClient(fc14_mock_config())
+        fallback = "https://fc.lab.local/_/pam-issuer/api/v1/auth/protocol/openid-connect/token"
+        assert client._token_url() == fallback
+        assert client._token_url() == TOKEN_URL
+        assert mock_get.call_count == 2
+        assert client._token_url() == TOKEN_URL
+        assert mock_get.call_count == 2  # success is cached
+
+    @patch("resource_queries.requests.get")
+    def test_discovery_without_token_endpoint_falls_back(self, mock_get):
+        mock_get.return_value = response(200, {})
+        client = FlightControlClient(fc14_mock_config())
+        assert client._token_url() == "https://fc.lab.local/_/pam-issuer/api/v1/auth/protocol/openid-connect/token"
+        assert client._discovered_token_url is None
+
 
 class TestTokenLifecycle:
     def test_uses_cached_cli_token_while_valid(self):

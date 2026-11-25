@@ -481,9 +481,13 @@ class FlightControlClient:
             )
             resp.raise_for_status()
             url = resp.json()["token_endpoint"]
-        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
-            url = f"{issuer}/protocol/openid-connect/token"
-            self.logger.warning("OIDC discovery failed for %s (%s); falling back to %s", issuer, e, url)
+            if not isinstance(url, str) or not url:
+                raise ValueError(f"token_endpoint is {url!r}")
+        except (requests.exceptions.RequestException, ValueError, KeyError, TypeError, AttributeError) as e:
+            # Not cached: a transient failure (e.g. server still booting) must not pin the fallback.
+            fallback = f"{issuer}/protocol/openid-connect/token"
+            self.logger.warning("OIDC discovery failed for %s (%s); falling back to %s", issuer, e, fallback)
+            return fallback
         self._discovered_token_url = url
         return url
 
