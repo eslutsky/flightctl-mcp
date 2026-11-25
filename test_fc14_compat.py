@@ -296,3 +296,75 @@ class TestTokenLifecycle:
         with patch("resource_queries.requests.post", return_value=response(500, {"error": "server_error"})):
             with pytest.raises(AuthenticationError, match="HTTP 500"):
                 c._get_access_token()
+
+
+DEVICE = {"metadata": {"name": "o1top", "labels": {"alias": "ushift-1"}}}
+
+
+class TestOrgAndDeviceLookup:
+    def test_queries_send_org_id(self):
+        c = client_with_token_url(organization="org-1")
+        with patch.object(c, "_get_access_token", return_value="t"), patch(
+            "resource_queries.requests.get", return_value=response(200, {"items": []})
+        ) as get:
+            c.query_devices(label_selector="fleet=lab")
+        assert get.call_args.kwargs["params"] == {"labelSelector": "fleet=lab", "org_id": "org-1"}
+        assert get.call_args.kwargs["verify"] == "/tmp/api-ca.crt"
+
+    def test_no_org_id_when_unset(self):
+        c = client_with_token_url()
+        with patch.object(c, "_get_access_token", return_value="t"), patch(
+            "resource_queries.requests.get", return_value=response(200, {"items": []})
+        ) as get:
+            c.query_devices(label_selector="fleet=lab")
+        assert get.call_args.kwargs["params"] == {"labelSelector": "fleet=lab"}
+
+    def test_get_device_found_and_missing(self):
+        c = client_with_token_url(organization="org-1")
+        with patch.object(c, "_get_access_token", return_value="t"), patch(
+            "resource_queries.requests.get", side_effect=[response(200, DEVICE), response(404, {})]
+        ) as get:
+            assert c.get_device("o1top") == DEVICE
+            assert c.get_device("nosuch") is None
+        assert get.call_args_list[0].args[0] == "https://fc.lab.local:3443/api/v1/devices/o1top"
+        assert get.call_args_list[0].kwargs["params"] == {"org_id": "org-1"}
+
+    def test_get_device_auth_error(self):
+        c = client_with_token_url()
+        with patch.object(c, "_get_access_token", return_value="t"), patch(
+            "resource_queries.requests.get", return_value=response(401, {})
+        ):
+            with pytest.raises(AuthenticationError):
+                c.get_device("o1top")
+
+    def test_resolve_by_alias(self):
+        c = client_with_token_url()
+        with patch.object(c, "query_devices", return_value=[DEVICE]) as q, patch.object(c, "get_device") as g:
+            assert c.resolve_device("ushift-1") is DEVICE
+        q.assert_called_once_with(label_selector="alias=ushift-1", limit=2)
+        g.assert_not_called()
+
+    def test_resolve_by_name_when_no_alias_matches(self):
+        c = client_with_token_url()
+        with patch.object(c, "query_devices", return_value=[]), patch.object(c, "get_device", return_value=DEVICE) as g:
+            assert c.resolve_device("o1top") is DEVICE
+        g.assert_called_once_with("o1top")
+
+    def test_resolve_ambiguous_alias(self):
+        c = client_with_token_url()
+        with patch.object(c, "query_devices", return_value=[DEVICE, DEVICE]):
+            with pytest.raises(FlightControlError, match="more than one device"):
+                c.resolve_device("ushift-1")
+
+    def test_resolve_unknown(self):
+        c = client_with_token_url()
+        with patch.object(c, "query_devices", return_value=[]), patch.object(c, "get_device", return_value=None):
+            with pytest.raises(FlightControlError, match="No device named or aliased 'ghost'"):
+                c.resolve_device("ghost")
+
+    def test_resolve_skips_alias_lookup_for_non_label_values(self):
+        c = client_with_token_url()
+        with patch.object(c, "query_devices") as q, patch.object(c, "get_device", return_value=None):
+            with pytest.raises(FlightControlError):
+                c.resolve_device("bad name!")
+        q.assert_not_called()

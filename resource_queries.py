@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import requests
 import yaml
@@ -115,6 +116,10 @@ def _is_invalid_grant(resp: Any) -> bool:
         return resp.json().get("error") == "invalid_grant"
     except (ValueError, AttributeError):
         return False
+
+
+# A Kubernetes-style label value; anything else can't be an alias, so skip the label lookup.
+_LABEL_VALUE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
 
 
 class Configuration:
@@ -355,6 +360,41 @@ class FlightControlClient:
             limit=limit,
         )
 
+    def get_device(self, name: str) -> Optional[Dict[str, Any]]:
+        """Fetch one device by its generated name. Returns None if it doesn't exist."""
+        url = f"{self.config.api_base_url}/api/v1/devices/{quote(name, safe='')}"
+        headers = {"Authorization": f"Bearer {self._get_access_token()}"}
+        params = {"org_id": self.config.organization} if self.config.organization else {}
+        try:
+            resp = requests.get(url, headers=headers, params=params, verify=self.config.get_ssl_verify(), timeout=30)
+        except requests.exceptions.RequestException as e:
+            raise APIError(f"Network error fetching device {name}: {e}")
+        if resp.status_code == 404:
+            return None
+        if resp.status_code == 401:
+            raise AuthenticationError(f"Authentication failed fetching device {name}")
+        try:
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError:
+            raise APIError(f"Failed to fetch device {name}: HTTP {resp.status_code}", resp.status_code, resp.text)
+        except ValueError as e:
+            raise APIError(f"Invalid JSON for device {name}: {e}")
+
+    def resolve_device(self, name_or_alias: str) -> Dict[str, Any]:
+        """Find a device by its `alias` label (e.g. ushift-1) or by its generated name."""
+        if _LABEL_VALUE.match(name_or_alias):
+            matches = self.query_devices(label_selector=f"alias={name_or_alias}", limit=2)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                names = ", ".join(m["metadata"]["name"] for m in matches)
+                raise FlightControlError(f"Alias '{name_or_alias}' matches more than one device: {names}")
+        device = self.get_device(name_or_alias)
+        if device is None:
+            raise FlightControlError(f"No device named or aliased '{name_or_alias}'")
+        return device
+
     def run_console_command(self, cli_path: str, device_name: str, command: str) -> str:
         """
         Runs a console command on a device using the installed flightctl CLI.
@@ -565,11 +605,13 @@ class FlightControlClient:
                 params["fieldSelector"] = field_selector
             if continue_token:
                 params["continue"] = continue_token
+            if self.config.organization:
+                params["org_id"] = self.config.organization
 
             self.logger.debug("Fetching page %d for %s", page_count, resource)
 
             try:
-                resp = requests.get(url, headers=headers, params=params, verify=self.config.get_ssl_verify())
+                resp = requests.get(url, headers=headers, params=params, verify=self.config.get_ssl_verify(), timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
             except requests.exceptions.HTTPError as e:
