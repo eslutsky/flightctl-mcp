@@ -1,5 +1,6 @@
 httpx
 fastmcp
+mcp<2
 requests>=2.0.0
 PyYAML>=6.0
 uvicorn>=0.30.0
