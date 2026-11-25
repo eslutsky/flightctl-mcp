@@ -1,15 +1,19 @@
+import base64
 import logging
 import logging.handlers
-import threading
-import time
+import os
+import re
 import shutil
 import subprocess
-import os
-import yaml
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+import yaml
 
 
 def setup_logging():
@@ -68,6 +72,32 @@ class APIError(FlightControlError):
         self.response_text = response_text
 
 
+_RFC3339 = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+
+
+def _parse_expiry(value: Any) -> float:
+    """RFC 3339 time as written by the flightctl CLI (nanosecond precision) -> epoch seconds; 0.0 if unknown."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str) and (m := _RFC3339.match(value.strip())):
+        frac = (m.group(2) or ".0")[:7]  # Python parses at most microseconds
+        tz = "+00:00" if m.group(3) == "Z" else m.group(3)
+        dt = datetime.fromisoformat(m.group(1) + frac + tz)
+    else:
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _write_ca_data(b64: str) -> str:
+    """Write base64 `certificate-authority-data` to a private temp file and return its path."""
+    fd, path = tempfile.mkstemp(prefix="flightctl-mcp-ca-", suffix=".crt")
+    with os.fdopen(fd, "wb") as f:
+        f.write(base64.b64decode(b64))
+    return path
+
+
 class Configuration:
     """Configuration manager that reads from flightctl config and environment variables."""
 
@@ -84,35 +114,38 @@ class Configuration:
         # Default values
         self.api_base_url = None
         self.oidc_token_url = None
+        self.oidc_issuer = None
         self.client_id = "flightctl"
+        self.client_secret = None
         self.refresh_token = None
+        self.cached_access_token = None
+        self.cached_access_token_expiry = 0.0
         self.insecure_skip_verify = False
         self.ca_cert_path = None
+        self.auth_ca_cert_path = None
+        self.organization = None
 
         # Try to read from flightctl config file
         if self.config_path.exists():
             try:
                 with open(self.config_path, "r") as f:
-                    config = yaml.safe_load(f)
+                    config = yaml.safe_load(f) or {}
 
                 # Extract service configuration
-                service_config = config.get("service", {})
-                self.api_base_url = service_config.get("server", "").rstrip("/")
+                service_config = config.get("service") or {}
+                self.api_base_url = (service_config.get("server") or "").rstrip("/") or None
                 self.insecure_skip_verify = service_config.get("insecureSkipVerify", False)
+                if service_config.get("certificate-authority-data"):
+                    self.ca_cert_path = _write_ca_data(service_config["certificate-authority-data"])
+                self.organization = config.get("organization") or None
 
                 # Extract authentication configuration
-                auth_config = config.get("authentication", {})
-                auth_provider = auth_config.get("auth-provider", {})
-                provider_config = auth_provider.get("config", {})
-
-                self.oidc_token_url = provider_config.get("server", "").rstrip("/")
-                self.client_id = provider_config.get("client-id", "flightctl")
-                self.refresh_token = provider_config.get("refresh-token")
-
-                # Check for certificate authority
-                ca_cert = provider_config.get("certificate-authority")
-                if ca_cert and Path(ca_cert).exists():
-                    self.ca_cert_path = ca_cert
+                auth_config = config.get("authentication") or {}
+                auth_provider = auth_config.get("auth-provider") or {}
+                if "auth-provider" in auth_provider:
+                    self._load_auth_fc14(auth_config, auth_provider)
+                else:
+                    self._load_auth_legacy(auth_provider)
 
                 self.logger.info("Loaded configuration from flightctl config file")
 
@@ -147,14 +180,35 @@ class Configuration:
 
         # Auto-fix OIDC URL format if needed
         if self.oidc_token_url and not self.oidc_token_url.endswith("/protocol/openid-connect/token"):
-            import re
-
             match = re.match(r"(https?://.+/realms/[^/]+)$", self.oidc_token_url)
             if match:
                 self.oidc_token_url = match.group(1) + "/protocol/openid-connect/token"
                 self.logger.debug("Auto-corrected OIDC token URL to: %s", self.oidc_token_url)
 
         self.logger.info("Configuration loaded - API: %s, Skip SSL: %s", self.api_base_url, self.insecure_skip_verify)
+
+    def _load_auth_legacy(self, auth_provider: Dict[str, Any]) -> None:
+        """Pre-1.x layout: authentication.auth-provider.config.{server,client-id,refresh-token}."""
+        provider_config = auth_provider.get("config", {}) or {}
+        self.oidc_token_url = (provider_config.get("server") or "").rstrip("/") or None
+        self.client_id = provider_config.get("client-id", "flightctl")
+        self.refresh_token = provider_config.get("refresh-token")
+        ca_cert = provider_config.get("certificate-authority")
+        if ca_cert and Path(ca_cert).exists():
+            self.ca_cert_path = ca_cert
+
+    def _load_auth_fc14(self, auth_config: Dict[str, Any], auth_provider: Dict[str, Any]) -> None:
+        """FC 1.4 layout: authentication.{refresh-token,access-token,...} + an embedded AuthProvider object."""
+        spec = (auth_provider.get("auth-provider") or {}).get("spec") or {}
+        self.oidc_issuer = (spec.get("issuer") or "").rstrip("/") or None
+        self.client_id = spec.get("clientId") or self.client_id
+        self.client_secret = spec.get("clientSecret") or None
+        self.refresh_token = auth_config.get("refresh-token")
+        self.cached_access_token = auth_config.get("access-token")
+        self.cached_access_token_expiry = _parse_expiry(auth_config.get("access-token-expiry"))
+        ca_file = auth_provider.get("ca-file")
+        if ca_file and Path(ca_file).exists():
+            self.auth_ca_cert_path = ca_file
 
     def get_ssl_verify(self):
         """Get SSL verification setting for requests."""
@@ -164,6 +218,12 @@ class Configuration:
             return self.ca_cert_path
         else:
             return True  # Use system CA bundle
+
+    def get_auth_ssl_verify(self):
+        """SSL verification for the token issuer: its own CA file if configured, else the API setting."""
+        if self.insecure_skip_verify:
+            return False
+        return self.auth_ca_cert_path or self.get_ssl_verify()
 
 
 class FlightControlClient:
