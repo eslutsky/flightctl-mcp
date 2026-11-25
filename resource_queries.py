@@ -98,6 +98,25 @@ def _write_ca_data(b64: str) -> str:
     return path
 
 
+REFRESH_HINT = (
+    "The Flight Control refresh token was rejected. Run `lab-env start` (or `flightctl login`) "
+    "on the host, then retry."
+)
+
+
+class InvalidGrantError(AuthenticationError):
+    """The token endpoint rejected the refresh token (OAuth error `invalid_grant`)."""
+
+
+def _is_invalid_grant(resp: Any) -> bool:
+    if resp.status_code not in (400, 401):
+        return False
+    try:
+        return resp.json().get("error") == "invalid_grant"
+    except (ValueError, AttributeError):
+        return False
+
+
 class Configuration:
     """Configuration manager that reads from flightctl config and environment variables."""
 
@@ -234,7 +253,7 @@ class FlightControlClient:
         # Validate required configuration
         if not self.config.api_base_url:
             raise FlightControlError("API_BASE_URL not configured. Set environment variable or run 'flightctl login'")
-        if not self.config.oidc_token_url:
+        if not (self.config.oidc_token_url or self.config.oidc_issuer):
             raise FlightControlError("OIDC_TOKEN_URL not configured. Set environment variable or run 'flightctl login'")
         if not self.config.refresh_token:
             raise FlightControlError("REFRESH_TOKEN not configured. Set environment variable or run 'flightctl login'")
@@ -242,6 +261,15 @@ class FlightControlClient:
         self._token_lock = threading.Lock()
         self._access_token = None
         self._token_expiry = 0  # Epoch seconds
+        self._refresh_token = self.config.refresh_token
+        self._discovered_token_url: Optional[str] = None
+        self._adopt_cached_token(self.config.cached_access_token, self.config.cached_access_token_expiry)
+
+        # Private flightctl CLI config for run_console_command (never the user's ~/.config/flightctl)
+        self.console_config_dir = Path(
+            os.environ.get("FLIGHTCTL_MCP_CONSOLE_DIR", str(Path.home() / ".config" / "flightctl-mcp"))
+        )
+        self._console_token: Optional[str] = None
 
         self.logger.info("FlightControl client initialized for API: %s", self.config.api_base_url)
 
@@ -407,46 +435,95 @@ class FlightControlClient:
 
     def _get_access_token(self) -> str:
         with self._token_lock:
-            now = time.time()
-            if self._access_token and now < self._token_expiry - 60:
+            if self._access_token and time.time() < self._token_expiry - 60:
                 self.logger.debug("Using cached access token")
-                assert self._access_token is not None
                 return self._access_token
-
-            self.logger.debug("Refreshing OIDC access token")
             try:
-                resp = requests.post(
-                    f"{self.config.oidc_token_url}",
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": self.config.refresh_token,
-                        "client_id": self.config.client_id,
-                    },
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    verify=self.config.get_ssl_verify(),
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                access_token = data["access_token"]
-                if not access_token or not isinstance(access_token, str):
-                    raise AuthenticationError("Invalid access token received from OIDC provider")
-                self._access_token = access_token
-                self._token_expiry = now + data.get("expires_in", 3600)
-                self.logger.info("Successfully refreshed OIDC access token")
-                return access_token
-            except requests.exceptions.RequestException as e:
-                self.logger.error("Failed to refresh OIDC token - network error: %s", e)
-                if hasattr(e, "response") and e.response is not None:
-                    self.logger.error("Response status: %s, body: %s", e.response.status_code, e.response.text)
-                    raise AuthenticationError(f"Failed to refresh OIDC token: HTTP {e.response.status_code}")
-                else:
-                    raise AuthenticationError(f"Failed to refresh OIDC token: {e}")
-            except KeyError as e:
-                self.logger.error("Invalid OIDC token response - missing field: %s", e)
-                raise AuthenticationError(f"Invalid OIDC token response: missing {e}")
-            except Exception as e:
-                self.logger.error("Unexpected error during token refresh: %s", e)
-                raise AuthenticationError(f"Failed to refresh OIDC token: {e}")
+                return self._refresh_access_token()
+            except InvalidGrantError:
+                self.logger.warning("Refresh token rejected; re-reading the flightctl client config once")
+                if not self._reload_tokens_from_cli_config():
+                    raise AuthenticationError(REFRESH_HINT)
+                if self._access_token and time.time() < self._token_expiry - 60:
+                    return self._access_token
+                try:
+                    return self._refresh_access_token()
+                except InvalidGrantError:
+                    raise AuthenticationError(REFRESH_HINT)
+
+    def _adopt_cached_token(self, token: Optional[str], expiry: float) -> None:
+        """Use an access token the CLI already holds, if it is valid for more than a minute."""
+        if token and expiry and time.time() < expiry - 60:
+            self._access_token = token
+            self._token_expiry = expiry
+
+    def _reload_tokens_from_cli_config(self) -> bool:
+        """Pick up a newer `flightctl login` (lab-env runs one on every host boot). True if anything changed."""
+        fresh = Configuration()
+        if not fresh.refresh_token or fresh.refresh_token == self._refresh_token:
+            return False
+        self._refresh_token = fresh.refresh_token
+        self._adopt_cached_token(fresh.cached_access_token, fresh.cached_access_token_expiry)
+        return True
+
+    def _token_url(self) -> str:
+        """Token endpoint: explicit config, else OIDC discovery on the issuer, else the Keycloak layout."""
+        if self.config.oidc_token_url:
+            return self.config.oidc_token_url
+        if self._discovered_token_url:
+            return self._discovered_token_url
+        issuer = self.config.oidc_issuer
+        try:
+            resp = requests.get(
+                f"{issuer}/.well-known/openid-configuration",
+                verify=self.config.get_auth_ssl_verify(),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            url = resp.json()["token_endpoint"]
+        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+            url = f"{issuer}/protocol/openid-connect/token"
+            self.logger.warning("OIDC discovery failed for %s (%s); falling back to %s", issuer, e, url)
+        self._discovered_token_url = url
+        return url
+
+    def _refresh_access_token(self) -> str:
+        """One refresh_token grant. Keeps a rotated refresh token. Raises InvalidGrantError on invalid_grant."""
+        data = {"grant_type": "refresh_token", "refresh_token": self._refresh_token, "client_id": self.config.client_id}
+        if self.config.client_secret:
+            data["client_secret"] = self.config.client_secret
+        now = time.time()
+        self.logger.debug("Refreshing OIDC access token")
+        try:
+            resp = requests.post(
+                self._token_url(),
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                verify=self.config.get_auth_ssl_verify(),
+                timeout=30,
+            )
+        except Exception as e:
+            self.logger.error("Failed to refresh OIDC token: %s", e)
+            raise AuthenticationError(f"Failed to refresh OIDC token: {e}")
+        if _is_invalid_grant(resp):
+            raise InvalidGrantError("Refresh token rejected (invalid_grant)")
+        try:
+            resp.raise_for_status()
+            body = resp.json()
+            access_token = body["access_token"]
+        except requests.exceptions.HTTPError:
+            self.logger.error("Token endpoint returned HTTP %s", resp.status_code)
+            raise AuthenticationError(f"Failed to refresh OIDC token: HTTP {resp.status_code}")
+        except (KeyError, ValueError) as e:
+            raise AuthenticationError(f"Invalid OIDC token response: missing {e}")
+        if not access_token or not isinstance(access_token, str):
+            raise AuthenticationError("Invalid access token received from OIDC provider")
+        if body.get("refresh_token"):
+            self._refresh_token = body["refresh_token"]
+        self._access_token = access_token
+        self._token_expiry = now + int(body.get("expires_in", 3600))
+        self.logger.info("Successfully refreshed OIDC access token")
+        return access_token
 
     def _query_resources(
         self,

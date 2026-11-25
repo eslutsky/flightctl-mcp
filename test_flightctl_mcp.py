@@ -124,10 +124,16 @@ class TestFlightControlClient:
         config = Mock()
         config.api_base_url = "https://api.test.com"
         config.oidc_token_url = "https://auth.test.com/token"
+        config.oidc_issuer = None
         config.client_id = "test-client"
+        config.client_secret = None
         config.refresh_token = "test-refresh-token"
+        config.cached_access_token = None
+        config.cached_access_token_expiry = 0.0
+        config.organization = None
         config.insecure_skip_verify = False
         config.get_ssl_verify.return_value = True
+        config.get_auth_ssl_verify.return_value = True
         return config
 
     @pytest.fixture
