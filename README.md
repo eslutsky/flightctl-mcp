@@ -392,3 +392,17 @@ This project is open source. See [LICENSE](LICENSE) for details.
 Issues and pull requests are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
+
+## Flight Control 1.4 compatibility (fork `eslutsky/flightctl-mcp`, branch `fc-1.4-compat`)
+
+- Reads the `client.yaml` that `flightctl login` 1.4 writes: `service.certificate-authority-data`,
+  `organization`, and the embedded `AuthProvider` (`issuer`, `clientId`, `ca-file`).
+- Finds the token endpoint with OIDC discovery (`{issuer}/.well-known/openid-configuration`);
+  works with the Flight Control PAM issuer. Keycloak URLs still work.
+- Starts from the CLI's cached access token, keeps rotated refresh tokens, and re-reads `client.yaml`
+  once if the refresh token is rejected.
+- `run_command_on_device` uses its own CLI config dir (`~/.config/flightctl-mcp`, or
+  `FLIGHTCTL_MCP_CONSOLE_DIR`), so it never overwrites your `flightctl login`. It accepts device
+  aliases, refuses offline devices, runs the command under `sh -c`, and returns exit code + stdout/stderr
+  (capped at 64 KiB, 60 s timeout).
+- Sends `org_id` on API calls when `organization` is set.
