@@ -371,11 +371,56 @@ class TestOrgAndDeviceLookup:
                 c.resolve_device("bad name!")
         q.assert_not_called()
 
+    def test_resolve_rejects_trailing_newline_alias(self):
+        c = client_with_token_url()
+        with patch.object(c, "query_devices") as q, patch.object(c, "get_device", return_value=None):
+            with pytest.raises(FlightControlError):
+                c.resolve_device("ushift-1\n")
+        q.assert_not_called()
+
+    @pytest.mark.parametrize("name", [".", "..", "  ", " . "])
+    def test_resolve_rejects_unusable_names(self, name):
+        c = client_with_token_url()
+        with patch.object(c, "query_devices") as q, patch.object(c, "get_device") as g:
+            with pytest.raises(FlightControlError, match="Invalid device name"):
+                c.resolve_device(name)
+        q.assert_not_called()
+        g.assert_not_called()
+
+
+class TestTokenResponse:
+    def test_null_expires_in_defaults(self):
+        c = client_with_token_url()
+        with patch("resource_queries.requests.post", return_value=response(200, {"access_token": "a", "expires_in": None})):
+            before = time.time()
+            assert c._refresh_access_token() == "a"
+        assert 3590 < c._token_expiry - before < 3610
+
+    def test_non_json_body(self):
+        c = client_with_token_url()
+        r = response(200, {})
+        r.json.side_effect = ValueError("no json")
+        with patch("resource_queries.requests.post", return_value=r):
+            with pytest.raises(AuthenticationError, match="not JSON"):
+                c._refresh_access_token()
+
+
+def test_cli_subprocesses_do_not_inherit_stdin():
+    from cli import FlightctlCLI
+
+    with patch("cli.shutil.which", return_value=None), patch("cli.subprocess.run") as run:
+        try:
+            FlightctlCLI("https://api.test.com").download()
+        except Exception:
+            pass
+    assert run.call_args_list
+    assert all(c.kwargs["stdin"] is subprocess.DEVNULL for c in run.call_args_list)
+
 
 ONLINE = {"metadata": {"name": "o1top"}, "status": {"summary": {"status": "Online", "info": "ok"}}}
 OFFLINE = {
     "metadata": {"name": "eh5t"},
-    "status": {"summary": {"status": "Unknown", "info": "Device is disconnected"}},
+    "status": {"summary": {"status": "Unknown", "info": "Device is disconnected."}},
 }
 NOISE = 'time="2026-11-25T16:05:16Z" level=info msg="no refresh token found, skipping token refresh"\n'
 
@@ -410,37 +455,46 @@ class TestConsole:
                 cred = Path(cmd[cmd.index("--credentials-file") + 1])
                 seen["cred"] = json.loads(cred.read_text())
                 seen["mode"] = cred.stat().st_mode & 0o777
+            seen.setdefault("stdin", []).append(kw.get("stdin"))
             return completed(0, "up 6:38\n", NOISE)
 
         out, run = run_console(console_client, fake_run, command="oc get pods -A | wc -l")
         d = str(console_client.console_config_dir)
         login, console = run.call_args_list[0].args[0], run.call_args_list[1].args[0]
+        cred_path = Path(login[login.index("--credentials-file") + 1])
+        assert cred_path.parent == console_client.console_config_dir
+        assert cred_path.name.startswith("credentials-")
         assert login == [
             "/usr/bin/flightctl", "login", "https://fc.lab.local:3443",
-            "--config-dir", d, "--credentials-file", f"{d}/credentials.json",
+            "--config-dir", d, "--credentials-file", str(cred_path),
             "--certificate-authority", "/tmp/api-ca.crt", "--org", "org-1",
         ]
         assert console == [
             "/usr/bin/flightctl", "console", "device/o1top", "--config-dir", d, "--notty",
             "--org", "org-1", "--", "sh", "-c", "oc get pods -A | wc -l",
         ]
-        assert seen == {"cred": {"token": "tok-1"}, "mode": 0o600}
-        assert not (console_client.console_config_dir / "credentials.json").exists()
+        assert seen == {"cred": {"token": "tok-1"}, "mode": 0o600, "stdin": [subprocess.DEVNULL] * 2}
+        assert not list(console_client.console_config_dir.glob("credentials-*"))
         assert console_client.console_config_dir.stat().st_mode & 0o777 == 0o700
         assert "tok-1" not in " ".join(login + console)
         assert out == "up 6:38"
 
-    def test_login_only_when_token_changes(self, console_client):
-        run_console(console_client, lambda cmd, **kw: completed(0, "x"))
-        _, run = run_console(console_client, lambda cmd, **kw: completed(0, "x"))
-        assert run.call_count == 1
-        assert run.call_args.args[0][1] == "console"
+    def test_logs_in_before_every_command(self, console_client):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd[1])
+            return completed(0, "x")
+
+        run_console(console_client, fake_run)
+        run_console(console_client, fake_run)
+        assert calls == ["login", "console", "login", "console"]
 
     def test_offline_device_refused_before_console(self, console_client):
         with patch.object(console_client, "resolve_device", return_value=OFFLINE), patch(
             "resource_queries.shutil.which", return_value="/usr/bin/flightctl"
         ), patch("resource_queries.subprocess.run") as run:
-            with pytest.raises(FlightControlError, match="is Unknown: Device is disconnected.*last-known status"):
+            with pytest.raises(FlightControlError, match=r"is Unknown: Device is disconnected\. Commands need.*last-known status"):
                 console_client.run_console_command("/usr/bin/flightctl", "ushift-3", "uptime")
         run.assert_not_called()
 
@@ -466,7 +520,7 @@ class TestConsole:
 
         with pytest.raises(FlightControlError, match="Failed to login to flightctl console: Error: unauthorized"):
             run_console(console_client, fake_run)
-        assert not (console_client.console_config_dir / "credentials.json").exists()
+        assert not list(console_client.console_config_dir.glob("credentials-*"))
 
     def test_empty_command_rejected(self, console_client):
         with patch("resource_queries.shutil.which", return_value="/usr/bin/flightctl"):

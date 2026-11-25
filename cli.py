@@ -33,8 +33,8 @@ class FlightctlCLI:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tar_path = os.path.join(tmpdir, "flightctl.tar.gz")
-            subprocess.run(["curl", "-kfLo", tar_path, cli_url], check=True, capture_output=True)
-            subprocess.run(["tar", "-xf", tar_path, "-C", tmpdir], check=True, capture_output=True)
+            subprocess.run(["curl", "-kfLo", tar_path, cli_url], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+            subprocess.run(["tar", "-xf", tar_path, "-C", tmpdir], check=True, capture_output=True, stdin=subprocess.DEVNULL)
 
             extracted_path = os.path.join(tmpdir, "flightctl")
             if not os.path.isfile(extracted_path):

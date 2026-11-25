@@ -300,7 +300,6 @@ class FlightControlClient:
         self.console_config_dir = Path(
             os.environ.get("FLIGHTCTL_MCP_CONSOLE_DIR", str(Path.home() / ".config" / "flightctl-mcp"))
         )
-        self._console_token: Optional[str] = None
 
         self.logger.info("FlightControl client initialized for API: %s", self.config.api_base_url)
 
@@ -409,7 +408,9 @@ class FlightControlClient:
 
     def resolve_device(self, name_or_alias: str) -> Dict[str, Any]:
         """Find a device by its `alias` label (e.g. ushift-1) or by its generated name."""
-        if _LABEL_VALUE.match(name_or_alias):
+        if name_or_alias.strip() in ("", ".", ".."):
+            raise FlightControlError(f"Invalid device name '{name_or_alias}'")
+        if _LABEL_VALUE.fullmatch(name_or_alias):
             matches = self.query_devices(label_selector=f"alias={name_or_alias}", limit=2)
             if len(matches) == 1:
                 return matches[0]
@@ -444,7 +445,7 @@ class FlightControlClient:
         state = summary.get("status")
         if state in OFFLINE_STATES:
             raise FlightControlError(
-                f"Device '{device_name}' ({name}) is {state}: {summary.get('info') or 'no details'}. "
+                f"Device '{device_name}' ({name}) is {state}: {(summary.get('info') or 'no details').rstrip('.')}. "
                 "Commands need a connected device; its last-known status is still available through query_devices."
             )
 
@@ -456,7 +457,7 @@ class FlightControlClient:
 
         self.logger.info("Running console command on device %s (%s): %s", device_name, name, command)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             raise FlightControlError(f"Command timed out after {timeout}s on device '{device_name}'")
         except OSError as e:
@@ -464,16 +465,13 @@ class FlightControlClient:
         return format_console_result(result.returncode, result.stdout, strip_cli_noise(result.stderr), max_output)
 
     def _console_login(self, cli_path: str, access_token: str) -> None:
-        """Log the private CLI config in with our access token; only when the token changed."""
-        if access_token == self._console_token:
-            return
+        """Log the private CLI config in with our access token. Done before every command: the
+        config dir is shared by several server processes, so cached login state can be stale."""
         conf_dir = self.console_config_dir
         conf_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(conf_dir, 0o700)
-        cred = conf_dir / "credentials.json"
-        fd = os.open(cred, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump({"token": access_token}, f)
+        fd, cred_name = tempfile.mkstemp(dir=conf_dir, prefix="credentials-", suffix=".json")
+        cred = Path(cred_name)
 
         cmd = [
             cli_path,
@@ -492,14 +490,17 @@ class FlightControlClient:
         if self.config.organization:
             cmd += ["--org", self.config.organization]
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"token": access_token}, f)
+            subprocess.run(
+                cmd, check=True, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL
+            )
         except subprocess.CalledProcessError as e:
             raise FlightControlError(f"Failed to login to flightctl console: {strip_cli_noise(e.stderr or '').strip()}")
         except subprocess.TimeoutExpired:
             raise FlightControlError("Timed out logging in to flightctl console")
         finally:
             cred.unlink(missing_ok=True)
-        self._console_token = access_token
 
     # --- Internal Methods ---
 
@@ -513,13 +514,13 @@ class FlightControlClient:
             except InvalidGrantError:
                 self.logger.warning("Refresh token rejected; re-reading the flightctl client config once")
                 if not self._reload_tokens_from_cli_config():
-                    raise AuthenticationError(REFRESH_HINT)
+                    raise AuthenticationError(REFRESH_HINT) from None
                 if self._access_token and time.time() < self._token_expiry - 60:
                     return self._access_token
                 try:
                     return self._refresh_access_token()
                 except InvalidGrantError:
-                    raise AuthenticationError(REFRESH_HINT)
+                    raise AuthenticationError(REFRESH_HINT) from None
 
     def _adopt_cached_token(self, token: Optional[str], expiry: float) -> None:
         """Use an access token the CLI already holds, if it is valid for more than a minute."""
@@ -585,17 +586,20 @@ class FlightControlClient:
             resp.raise_for_status()
             body = resp.json()
             access_token = body["access_token"]
+            expires_in = int(body.get("expires_in") or 3600)
         except requests.exceptions.HTTPError:
             self.logger.error("Token endpoint returned HTTP %s", resp.status_code)
             raise AuthenticationError(f"Failed to refresh OIDC token: HTTP {resp.status_code}")
-        except (KeyError, ValueError) as e:
+        except KeyError as e:
             raise AuthenticationError(f"Invalid OIDC token response: missing {e}")
+        except (ValueError, TypeError, AttributeError):
+            raise AuthenticationError("Invalid OIDC token response: not JSON")
         if not access_token or not isinstance(access_token, str):
             raise AuthenticationError("Invalid access token received from OIDC provider")
         if body.get("refresh_token"):
             self._refresh_token = body["refresh_token"]
         self._access_token = access_token
-        self._token_expiry = now + int(body.get("expires_in", 3600))
+        self._token_expiry = now + expires_in
         self.logger.info("Successfully refreshed OIDC access token")
         return access_token
 
